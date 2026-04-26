@@ -1,10 +1,18 @@
 // Public package entry. v0 surface is intentionally tiny:
-//   - Connection — direct connect()/query()/end() (this slice).
-//   - createClient(), sql tag, pool — added in upcoming layers.
+//   - Connection — direct connect()/query()/extQuery()/end().
+//   - Codec / CodecRegistry — pluggable type decoding.
+//   - PgError + SQLSTATE subclasses + ConnectionError hierarchy.
 //
+// Higher-level APIs (createClient, sql tag, pool) are added in upcoming layers.
 // The protocol layer is reachable via `pg-rocket/protocol` for embedders
 // implementing alternative transports.
 
+export {
+  type Codec,
+  CodecRegistry,
+  getDefaultRegistry,
+  Oid,
+} from "./codecs/index.js";
 export {
   Connection,
   type ConnectOptions,
@@ -14,7 +22,7 @@ export {
   nodeCryptoProvider,
   type PasswordSpec,
   type QueryResult,
-  type SimpleQueryRow,
+  type Row,
   type TlsMode,
   type TlsOptions,
   type TlsUpgradeOptions,

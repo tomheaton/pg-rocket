@@ -2,22 +2,30 @@
 //
 // State transitions are driven by `ReadyForQuery` boundaries, not by counting
 // individual messages, so we always agree with the server about transaction
-// state. `query()` ends only when ReadyForQuery arrives, even if an
-// ErrorResponse came earlier in the same exchange.
+// state. Both `query()` and `extQuery()` end only when ReadyForQuery arrives,
+// even if an ErrorResponse came earlier in the same exchange.
 //
 // What's implemented in this slice:
 //   * SSL negotiation + TLS upgrade
 //   * StartupMessage + ParameterStatus + BackendKeyData accumulation
 //   * Auth: AuthenticationOk, CleartextPassword, MD5Password, SCRAM-SHA-256
 //   * Simple-query path (Q → RowDescription/DataRow*/CommandComplete → ReadyForQuery)
+//   * Extended-query path (Parse/Bind/Describe/Execute/Sync) with codec-aware
+//     row decoding and JS-value parameter inference. Single-shot, no cache yet.
 //   * Graceful end() (Terminate + FIN)
 //
 // Deliberately not yet implemented (next layers):
-//   * Extended query (Parse/Bind/Describe/Execute/Sync) and prepared cache
+//   * Prepared-statement cache (named statements, FNV-1a key, LRU eviction)
 //   * Pipeliner (multiple commands, one coalesced write)
-//   * Codecs (everything is text-format strings here)
+//   * Binary-format codecs (everything is text-format here)
 //   * COPY, LISTEN/NOTIFY, cursors, cancellation
 
+import {
+  type Codec,
+  type CodecRegistry,
+  getDefaultRegistry,
+  Oid,
+} from "../codecs/index.js";
 import {
   AuthenticationError,
   ConnectionError,
@@ -29,7 +37,13 @@ import { md5PasswordToken } from "../protocol/auth/md5.js";
 import * as scram from "../protocol/auth/scram.js";
 import { parseCommandTag, readCString, readUtf8 } from "../protocol/body.js";
 import type { CryptoProvider } from "../protocol/crypto.js";
-import { AuthRequest, BackendKind, TxStatus } from "../protocol/messages.js";
+import {
+  AuthRequest,
+  BackendKind,
+  Format,
+  StatementOrPortal,
+  TxStatus,
+} from "../protocol/messages.js";
 import { type BackendMessage, MessageReader } from "../protocol/reader.js";
 import { MessageWriter } from "../protocol/writer.js";
 import { nodeCryptoProvider } from "./node-crypto.js";
@@ -58,12 +72,14 @@ export interface ConnectOptions {
   readonly tls?: TlsMode | TlsOptions;
   /** Inject an alternate CryptoProvider; defaults to a node:crypto-backed one. */
   readonly crypto?: CryptoProvider;
+  /** Inject an alternate codec registry; defaults to the day-one scalars. */
+  readonly codecs?: CodecRegistry;
 }
 
-export type SimpleQueryRow = Record<string, string | null>;
+export type Row = Record<string, unknown>;
 
-export interface QueryResult<Row = SimpleQueryRow> {
-  readonly rows: Row[];
+export interface QueryResult<R = Row> {
+  readonly rows: R[];
   readonly rowCount: number;
   readonly command: string;
 }
@@ -100,6 +116,8 @@ type MessageWaiter = {
   reject: (e: Error) => void;
 };
 
+const utf8Encoder = new TextEncoder();
+
 export class Connection {
   // Public, observable connection-level state populated during handshake.
   readonly serverParameters = new Map<string, string>();
@@ -117,6 +135,7 @@ export class Connection {
   private constructor(
     private readonly transport: Transport,
     private readonly crypto: CryptoProvider,
+    private readonly codecs: CodecRegistry,
     private readonly options: ConnectOptions,
   ) {
     transport.onData((chunk) => this.onTransportData(chunk));
@@ -132,6 +151,7 @@ export class Connection {
     const conn = new Connection(
       transport,
       options.crypto ?? nodeCryptoProvider,
+      options.codecs ?? getDefaultRegistry(),
       options,
     );
     try {
@@ -161,9 +181,14 @@ export class Connection {
   }
 
   // ────────────────────────────────────────────────────────────────────────
-  // Public query API (simple-query path only in this slice)
+  // Public query API
 
-  async query<Row = SimpleQueryRow>(sql: string): Promise<QueryResult<Row>> {
+  /**
+   * Simple-query (`Q`) path. The whole SQL string is sent unparameterised; the
+   * server replies in text format. Useful for DDL and quick one-off queries.
+   * For parameterised queries prefer {@link extQuery}.
+   */
+  async query<R = Row>(sql: string): Promise<QueryResult<R>> {
     if (this.state !== "ready") {
       throw new ConnectionError(`connection not ready (state=${this.state})`);
     }
@@ -172,14 +197,75 @@ export class Connection {
     this.writer.writeQuery(sql);
     await this.flush();
 
+    return this.consumeUntilReady<R>();
+  }
+
+  /**
+   * Extended-query path. One pipelined batch: Parse + Bind + Describe(portal)
+   * + Execute + Sync — single round-trip. Parameter types are inferred from
+   * the JS values; result rows are decoded via the codec registry.
+   *
+   * Result format is text for every column in this slice — binary lands when
+   * the prepared cache motivates Describe-statement up front.
+   */
+  async extQuery<R = Row>(
+    sql: string,
+    params: ReadonlyArray<unknown> = [],
+  ): Promise<QueryResult<R>> {
+    if (this.state !== "ready") {
+      throw new ConnectionError(`connection not ready (state=${this.state})`);
+    }
+    this.state = "busy";
+
+    const paramOids: number[] = new Array(params.length);
+    const paramBytes: Array<Uint8Array | null> = new Array(params.length);
+    for (let i = 0; i < params.length; i++) {
+      const encoded = encodeParam(params[i], this.codecs);
+      paramOids[i] = encoded.oid;
+      paramBytes[i] = encoded.bytes;
+    }
+    // length-1 format array: applies to every parameter (text in this slice).
+    const paramFormats = params.length === 0 ? [] : [Format.Text];
+    // length-1 result format: all columns text. Per-column binary is a cache-era optimisation.
+    const resultFormats = [Format.Text];
+
+    this.writer.writeParse("", sql, paramOids);
+    this.writer.writeBind({
+      portal: "",
+      statement: "",
+      paramFormats,
+      params: paramBytes,
+      resultFormats,
+    });
+    this.writer.writeDescribe(StatementOrPortal.Portal, "");
+    this.writer.writeExecute("", 0);
+    this.writer.writeSync();
+    await this.flush();
+
+    return this.consumeUntilReady<R>();
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Shared response handling
+
+  private async consumeUntilReady<R>(): Promise<QueryResult<R>> {
     let rowDescription: FieldDescription[] | null = null;
-    const rows: Row[] = [];
+    const rows: R[] = [];
     let commandTag = "";
     let pendingError: PgError | null = null;
 
     while (true) {
       const msg = await this.awaitMessage();
       switch (msg.kind) {
+        // Acks with no body we care about.
+        case BackendKind.ParseComplete:
+        case BackendKind.BindComplete:
+        case BackendKind.CloseComplete:
+        case BackendKind.NoData:
+        case BackendKind.ParameterDescription:
+        case BackendKind.PortalSuspended:
+        case BackendKind.EmptyQueryResponse:
+          break;
         case BackendKind.RowDescription:
           rowDescription = parseRowDescription(
             this.reader.bytes,
@@ -189,19 +275,19 @@ export class Connection {
           break;
         case BackendKind.DataRow: {
           if (rowDescription === null) {
-            this.fatal(new ProtocolError("DataRow before RowDescription"));
-            throw (
-              this.closeError ??
-              new ProtocolError("DataRow before RowDescription")
-            );
+            const err = new ProtocolError("DataRow before RowDescription");
+            this.fatal(err);
+            throw err;
           }
-          const row = parseDataRowAsObject(
-            this.reader.bytes,
-            this.reader.view,
-            msg.offset,
-            rowDescription,
+          rows.push(
+            decodeRow(
+              this.reader.bytes,
+              this.reader.view,
+              msg.offset,
+              rowDescription,
+              this.codecs,
+            ) as R,
           );
-          rows.push(row as Row);
           break;
         }
         case BackendKind.CommandComplete:
@@ -210,9 +296,6 @@ export class Connection {
             msg.offset,
             msg.offset + msg.length,
           ).value;
-          break;
-        case BackendKind.EmptyQueryResponse:
-          // No-op: empty input string. ReadyForQuery still follows.
           break;
         case BackendKind.ErrorResponse:
           pendingError = decodeErrorResponse(
@@ -232,7 +315,7 @@ export class Connection {
           // CopyInResponse / CopyOutResponse / etc. fall here. The connection's
           // state is now indeterminate — bail and force the caller to reconnect.
           const err = new ProtocolError(
-            `unexpected message in simple-query path: 0x${msg.kind.toString(16).padStart(2, "0")}`,
+            `unexpected message: 0x${msg.kind.toString(16).padStart(2, "0")}`,
           );
           this.fatal(err);
           throw err;
@@ -629,12 +712,13 @@ function parseRowDescription(
   return fields;
 }
 
-function parseDataRowAsObject(
+function decodeRow(
   buf: Uint8Array,
   view: DataView,
   offset: number,
   fields: readonly FieldDescription[],
-): SimpleQueryRow {
+  codecs: CodecRegistry,
+): Row {
   const count = view.getInt16(offset, false);
   if (count !== fields.length) {
     throw new ProtocolError(
@@ -642,7 +726,7 @@ function parseDataRowAsObject(
     );
   }
   let pos = offset + 2;
-  const out: SimpleQueryRow = {};
+  const out: Row = {};
   for (let i = 0; i < count; i++) {
     const len = view.getInt32(pos, false);
     pos += 4;
@@ -650,11 +734,77 @@ function parseDataRowAsObject(
     if (len === -1) {
       out[field.name] = null;
     } else {
-      out[field.name] = readUtf8(buf, pos, len);
+      const text = readUtf8(buf, pos, len);
+      const codec = codecs.get(field.dataTypeOid);
+      out[field.name] = codec !== undefined ? codec.decode(text) : text;
       pos += len;
     }
   }
   return out;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Parameter inference + encoding.
+//
+// Maps JS values to Postgres OIDs and text-format byte strings. Round-trips
+// through the registry so user-installed codecs participate without
+// special-casing here. Values whose JS type doesn't have an obvious Postgres
+// counterpart (functions, symbols) raise a TypeError.
+
+interface EncodedParam {
+  readonly oid: number;
+  readonly bytes: Uint8Array | null;
+}
+
+function encodeParam(value: unknown, codecs: CodecRegistry): EncodedParam {
+  if (value === null || value === undefined) {
+    return { oid: 0, bytes: null };
+  }
+  if (typeof value === "boolean") {
+    return encodeVia(codecs, Oid.Bool, value);
+  }
+  if (typeof value === "number") {
+    if (
+      Number.isInteger(value) &&
+      value >= -2147483648 &&
+      value <= 2147483647
+    ) {
+      return encodeVia(codecs, Oid.Int4, value);
+    }
+    return encodeVia(codecs, Oid.Float8, value);
+  }
+  if (typeof value === "bigint") {
+    return encodeVia(codecs, Oid.Int8, value);
+  }
+  if (typeof value === "string") {
+    // text passes through verbatim; no codec lookup needed.
+    return { oid: Oid.Text, bytes: utf8Encoder.encode(value) };
+  }
+  if (value instanceof Uint8Array) {
+    return encodeVia(codecs, Oid.Bytea, value);
+  }
+  if (value instanceof Date) {
+    return encodeVia(codecs, Oid.TimestampTz, value);
+  }
+  if (typeof value === "object") {
+    // Includes plain objects and arrays — both stringify to JSON.
+    return encodeVia(codecs, Oid.Jsonb, value);
+  }
+  throw new TypeError(
+    `pg-rocket: cannot encode parameter of type ${typeof value}`,
+  );
+}
+
+function encodeVia(
+  codecs: CodecRegistry,
+  oid: number,
+  value: unknown,
+): EncodedParam {
+  const codec = codecs.get(oid) as Codec<unknown> | undefined;
+  if (codec === undefined) {
+    throw new TypeError(`pg-rocket: no codec registered for OID ${oid}`);
+  }
+  return { oid, bytes: utf8Encoder.encode(codec.encode(value)) };
 }
 
 async function resolvePassword(

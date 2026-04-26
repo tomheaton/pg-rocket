@@ -7,7 +7,7 @@ export {
   type FieldDescription,
   type PasswordSpec,
   type QueryResult,
-  type SimpleQueryRow,
+  type Row,
   type TlsMode,
   type TlsOptions,
 } from "./connection.js";
