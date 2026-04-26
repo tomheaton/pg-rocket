@@ -1,12 +1,20 @@
-// Public package entry. v0 surface is intentionally tiny:
-//   - Connection — direct connect()/query()/extQuery()/end().
-//   - Codec / CodecRegistry — pluggable type decoding.
-//   - PgError + SQLSTATE subclasses + ConnectionError hierarchy.
+// Public package entry. v0 surface:
 //
-// Higher-level APIs (createClient, sql tag, pool) are added in upcoming layers.
+//   createClient, Db                       — the headline factory + facade
+//   sql, sql.id / .unsafe / .cast / etc.   — the template tag + helpers
+//   Transaction, Savepoint                 — transaction primitives
+//   Connection, Pool                       — lower-level escape hatches
+//   PgError + SQLSTATE subclasses          — error hierarchy
+//
 // The protocol layer is reachable via `pg-rocket/protocol` for embedders
 // implementing alternative transports.
 
+export {
+  type CreateClientOptions,
+  createClient,
+  Db,
+  type DbOptions,
+} from "./client.js";
 export {
   type Codec,
   CodecRegistry,
@@ -20,7 +28,9 @@ export {
   type FieldDescription,
   NodeTransport,
   nodeCryptoProvider,
+  type OnConnect,
   type PasswordSpec,
+  type QueryOptions,
   type QueryResult,
   type Row,
   type TlsMode,
@@ -43,3 +53,38 @@ export {
   SerializationFailure,
   UniqueViolation,
 } from "./errors.js";
+export type {
+  ErrorEvent,
+  NoticeEvent,
+  OnError,
+  OnNotice,
+  OnQuery,
+  QueryEvent,
+} from "./observability.js";
+export {
+  type ParsedConnectionString,
+  Pool,
+  type PoolOptions,
+  parseConnectionString,
+} from "./pool/index.js";
+export {
+  Cast,
+  cast,
+  Fragment,
+  Identifier,
+  id,
+  join,
+  type MaterializedSql,
+  materialize,
+  raw,
+  SqlPart,
+  sql,
+  Unsafe,
+  unsafe,
+} from "./sql/index.js";
+export {
+  type BeginOptions,
+  type IsolationLevel,
+  Savepoint,
+  Transaction,
+} from "./transaction.js";

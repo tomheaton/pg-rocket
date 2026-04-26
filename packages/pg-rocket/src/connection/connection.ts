@@ -12,13 +12,15 @@
 //   * Simple-query path (Q → RowDescription/DataRow*/CommandComplete → ReadyForQuery)
 //   * Extended-query path (Parse/Bind/Describe/Execute/Sync) with codec-aware
 //     row decoding and JS-value parameter inference. Single-shot, no cache yet.
+//   * AbortSignal cancellation via side-connection CancelRequest (cancel()).
+//   * Observability hooks: onQuery, onError, onNotice, onConnect.
 //   * Graceful end() (Terminate + FIN)
 //
 // Deliberately not yet implemented (next layers):
 //   * Prepared-statement cache (named statements, FNV-1a key, LRU eviction)
 //   * Pipeliner (multiple commands, one coalesced write)
 //   * Binary-format codecs (everything is text-format here)
-//   * COPY, LISTEN/NOTIFY, cursors, cancellation
+//   * COPY, LISTEN/NOTIFY, cursors
 
 import {
   type Codec,
@@ -33,13 +35,20 @@ import {
   type PgError,
   ProtocolError,
 } from "../errors.js";
+import type { OnError, OnNotice, OnQuery } from "../observability.js";
 import { md5PasswordToken } from "../protocol/auth/md5.js";
 import * as scram from "../protocol/auth/scram.js";
-import { parseCommandTag, readCString, readUtf8 } from "../protocol/body.js";
+import {
+  parseCommandTag,
+  readCString,
+  readErrorFields,
+  readUtf8,
+} from "../protocol/body.js";
 import type { CryptoProvider } from "../protocol/crypto.js";
 import {
   AuthRequest,
   BackendKind,
+  FieldCode,
   Format,
   StatementOrPortal,
   TxStatus,
@@ -61,6 +70,14 @@ export interface TlsOptions extends TlsUpgradeOptions {
 
 export type PasswordSpec = string | (() => string | Promise<string>);
 
+/**
+ * Per-connection setup hook. Runs after the handshake completes but before
+ * the connection is handed back to the caller — the user can issue setup
+ * statements (`set search_path …`, `set timezone …`) here that every query
+ * on this connection inherits.
+ */
+export type OnConnect = (conn: Connection) => Promise<void> | void;
+
 export interface ConnectOptions {
   readonly host: string;
   readonly port: number;
@@ -74,6 +91,14 @@ export interface ConnectOptions {
   readonly crypto?: CryptoProvider;
   /** Inject an alternate codec registry; defaults to the day-one scalars. */
   readonly codecs?: CodecRegistry;
+  /** Fires once a query settles successfully (sees CommandComplete + ReadyForQuery). */
+  readonly onQuery?: OnQuery;
+  /** Fires when a query fails — server ErrorResponse, transport error, or cancel. */
+  readonly onError?: OnError;
+  /** Fires for every backend NoticeResponse (server-side warnings, RAISE NOTICE, etc.). */
+  readonly onNotice?: OnNotice;
+  /** Fires once the handshake completes; the connection isn't returned until the hook resolves. */
+  readonly onConnect?: OnConnect;
 }
 
 export type Row = Record<string, unknown>;
@@ -82,6 +107,15 @@ export interface QueryResult<R = Row> {
   readonly rows: R[];
   readonly rowCount: number;
   readonly command: string;
+}
+
+export interface QueryOptions {
+  /**
+   * Cancel the in-flight query when this signal fires. Triggers a side-channel
+   * `CancelRequest`; the query then errors with `QueryCanceled` (SQLSTATE 57014).
+   * Pre-aborted signals throw `signal.reason` immediately.
+   */
+  readonly signal?: AbortSignal;
 }
 
 export interface FieldDescription {
@@ -118,7 +152,11 @@ type MessageWaiter = {
 
 const utf8Encoder = new TextEncoder();
 
+let nextConnectionId = 0;
+
 export class Connection {
+  /** Stable per-process id, included in every observability event. */
+  readonly id: number = ++nextConnectionId;
   // Public, observable connection-level state populated during handshake.
   readonly serverParameters = new Map<string, string>();
   processId = 0;
@@ -126,11 +164,26 @@ export class Connection {
   txStatus: number = TxStatus.Idle;
 
   private state: ConnectionState = "connecting";
+  /**
+   * True while the connection is still usable for new commands. False after
+   * `end()`, transport errors, or any protocol-level fatal — pool release paths
+   * read this to decide between returning the connection to idle and dropping it.
+   */
+  get isUsable(): boolean {
+    return this.state === "ready" || this.state === "busy";
+  }
   private readonly writer = new MessageWriter();
   private readonly reader = new MessageReader();
   private negotiationWaiter: NegotiationWaiter | null = null;
   private messageWaiter: MessageWaiter | null = null;
   private closeError: Error | null = null;
+
+  // Hook references captured at construction. The hot-path firing site is
+  // `if (this.onX !== undefined) { … allocate event …; this.onX(event); }`,
+  // so connections without hooks pay only a single property compare per query.
+  private readonly onQuery: OnQuery | undefined;
+  private readonly onError: OnError | undefined;
+  private readonly onNotice: OnNotice | undefined;
 
   private constructor(
     private readonly transport: Transport,
@@ -138,6 +191,9 @@ export class Connection {
     private readonly codecs: CodecRegistry,
     private readonly options: ConnectOptions,
   ) {
+    this.onQuery = options.onQuery;
+    this.onError = options.onError;
+    this.onNotice = options.onNotice;
     transport.onData((chunk) => this.onTransportData(chunk));
     transport.onError((err) => this.onTransportError(err));
     transport.onClose(() => this.onTransportClose());
@@ -156,6 +212,12 @@ export class Connection {
     );
     try {
       await conn.handshake();
+      if (options.onConnect !== undefined) {
+        // The hook may issue queries; we don't return the connection until it
+        // resolves. If it throws, tear down — the user expects a connection
+        // that's already been initialised, or no connection at all.
+        await options.onConnect(conn);
+      }
     } catch (err) {
       transport.destroy();
       throw err;
@@ -188,16 +250,10 @@ export class Connection {
    * server replies in text format. Useful for DDL and quick one-off queries.
    * For parameterised queries prefer {@link extQuery}.
    */
-  async query<R = Row>(sql: string): Promise<QueryResult<R>> {
-    if (this.state !== "ready") {
-      throw new ConnectionError(`connection not ready (state=${this.state})`);
-    }
-    this.state = "busy";
-
-    this.writer.writeQuery(sql);
-    await this.flush();
-
-    return this.consumeUntilReady<R>();
+  query<R = Row>(sql: string, options?: QueryOptions): Promise<QueryResult<R>> {
+    return this.runQuery<R>(sql, [], options, () => {
+      this.writer.writeQuery(sql);
+    });
   }
 
   /**
@@ -208,15 +264,97 @@ export class Connection {
    * Result format is text for every column in this slice — binary lands when
    * the prepared cache motivates Describe-statement up front.
    */
-  async extQuery<R = Row>(
+  extQuery<R = Row>(
     sql: string,
     params: ReadonlyArray<unknown> = [],
+    options?: QueryOptions,
   ): Promise<QueryResult<R>> {
+    return this.runQuery<R>(sql, params, options, () => {
+      const paramOids: number[] = new Array(params.length);
+      const paramBytes: Array<Uint8Array | null> = new Array(params.length);
+      for (let i = 0; i < params.length; i++) {
+        const encoded = encodeParam(params[i], this.codecs);
+        paramOids[i] = encoded.oid;
+        paramBytes[i] = encoded.bytes;
+      }
+      // length-1 format array: applies to every parameter (text in this slice).
+      const paramFormats = params.length === 0 ? [] : [Format.Text];
+      // length-1 result format: all columns text. Per-column binary is a cache-era optimisation.
+      const resultFormats = [Format.Text];
+
+      this.writer.writeParse("", sql, paramOids);
+      this.writer.writeBind({
+        portal: "",
+        statement: "",
+        paramFormats,
+        params: paramBytes,
+        resultFormats,
+      });
+      this.writer.writeDescribe(StatementOrPortal.Portal, "");
+      this.writer.writeExecute("", 0);
+      this.writer.writeSync();
+    });
+  }
+
+  /**
+   * Best-effort query cancellation. Opens a side TCP connection, sends a
+   * `CancelRequest` carrying the BackendKeyData captured during handshake,
+   * then closes. The in-flight query naturally errors with SQLSTATE 57014
+   * (QueryCanceled) on the main connection — the cancel itself never blocks
+   * and never throws back to the caller (best-effort by protocol).
+   *
+   * Threaded automatically when callers pass `{ signal }` to query/extQuery.
+   */
+  async cancel(): Promise<void> {
+    if (this.processId === 0 || this.secretKey === 0) {
+      // Not far enough through handshake; cancel is meaningless.
+      return;
+    }
+    let sideTransport: Transport | null = null;
+    try {
+      sideTransport = await connectTcp(this.options.host, this.options.port);
+      const sideWriter = new MessageWriter();
+      sideWriter.writeCancelRequest(this.processId, this.secretKey);
+      // Copy out before sending — sideWriter is single-use here, but the same
+      // safety pattern as the main flush() since we may end() before the write
+      // promise resolves on slow networks.
+      await sideTransport.write(sideWriter.bytes().slice());
+    } catch {
+      // best-effort
+    } finally {
+      sideTransport?.end();
+    }
+  }
+
+  /**
+   * Portal-based cursor. Yields up to `batchSize` rows per iteration; drives
+   * the protocol with a Parse/Bind/Describe/Execute(N)/Sync prologue, then
+   * Execute(N)/Sync per subsequent batch until the server reports
+   * `CommandComplete`. The connection stays in a busy state for the entire
+   * cursor's lifetime — concurrent queries on the same connection are
+   * rejected.
+   *
+   * Cleanup is in a `finally` so abandoning the iterator (`break`, `throw`,
+   * `return()`) closes the portal cleanly and returns the connection to the
+   * `ready` state. AbortSignal is supported the same way as query/extQuery.
+   */
+  async *cursor<R = Row>(
+    sql: string,
+    params: ReadonlyArray<unknown> = [],
+    batchSize = 100,
+    options?: QueryOptions,
+  ): AsyncGenerator<R[], void, undefined> {
+    if (batchSize < 1) {
+      throw new RangeError(`cursor: batchSize must be >= 1, got ${batchSize}`);
+    }
     if (this.state !== "ready") {
       throw new ConnectionError(`connection not ready (state=${this.state})`);
     }
+    options?.signal?.throwIfAborted();
     this.state = "busy";
 
+    // Same encode dance as extQuery; kept inline so we don't pre-allocate
+    // anything when callers don't actually use cursors.
     const paramOids: number[] = new Array(params.length);
     const paramBytes: Array<Uint8Array | null> = new Array(params.length);
     for (let i = 0; i < params.length; i++) {
@@ -224,25 +362,236 @@ export class Connection {
       paramOids[i] = encoded.oid;
       paramBytes[i] = encoded.bytes;
     }
-    // length-1 format array: applies to every parameter (text in this slice).
     const paramFormats = params.length === 0 ? [] : [Format.Text];
-    // length-1 result format: all columns text. Per-column binary is a cache-era optimisation.
     const resultFormats = [Format.Text];
 
-    this.writer.writeParse("", sql, paramOids);
-    this.writer.writeBind({
-      portal: "",
-      statement: "",
-      paramFormats,
-      params: paramBytes,
-      resultFormats,
-    });
-    this.writer.writeDescribe(StatementOrPortal.Portal, "");
-    this.writer.writeExecute("", 0);
-    this.writer.writeSync();
-    await this.flush();
+    let abortHandler: (() => void) | null = null;
+    if (options?.signal !== undefined) {
+      abortHandler = (): void => {
+        void this.cancel();
+      };
+      options.signal.addEventListener("abort", abortHandler, { once: true });
+    }
 
-    return this.consumeUntilReady<R>();
+    // The portal is "open" as soon as the server has accepted Bind. Until then
+    // there's nothing to clean up. After CommandComplete or any ErrorResponse
+    // the server has already closed it implicitly — clearing the flag avoids
+    // a redundant Close in cleanup.
+    let portalOpen = false;
+    let rowDescription: FieldDescription[] | null = null;
+
+    try {
+      this.writer.writeParse("", sql, paramOids);
+      this.writer.writeBind({
+        portal: "",
+        statement: "",
+        paramFormats,
+        params: paramBytes,
+        resultFormats,
+      });
+      this.writer.writeDescribe(StatementOrPortal.Portal, "");
+      this.writer.writeExecute("", batchSize);
+      this.writer.writeSync();
+      await this.flush();
+      portalOpen = true;
+
+      while (true) {
+        const batch: R[] = [];
+        let suspended = false;
+        let completed = false;
+        let pendingError: PgError | null = null;
+
+        // Drain one round-trip: messages until ReadyForQuery.
+        let sawReady = false;
+        while (!sawReady) {
+          const msg = await this.awaitMessage();
+          switch (msg.kind) {
+            case BackendKind.ParseComplete:
+            case BackendKind.BindComplete:
+            case BackendKind.NoData:
+            case BackendKind.ParameterDescription:
+            case BackendKind.EmptyQueryResponse:
+              break;
+            case BackendKind.RowDescription:
+              rowDescription = parseRowDescription(
+                this.reader.bytes,
+                this.reader.view,
+                msg.offset,
+              );
+              break;
+            case BackendKind.DataRow: {
+              if (rowDescription === null) {
+                const err = new ProtocolError("DataRow before RowDescription");
+                this.fatal(err);
+                throw err;
+              }
+              batch.push(
+                decodeRow(
+                  this.reader.bytes,
+                  this.reader.view,
+                  msg.offset,
+                  rowDescription,
+                  this.codecs,
+                ) as R,
+              );
+              break;
+            }
+            case BackendKind.PortalSuspended:
+              suspended = true;
+              break;
+            case BackendKind.CommandComplete:
+              completed = true;
+              break;
+            case BackendKind.ErrorResponse:
+              pendingError = decodeErrorResponse(
+                this.reader.bytes,
+                msg.offset,
+                msg.length,
+              );
+              // The server's implicit transaction is now in a failed state;
+              // it auto-closes the portal at the upcoming Sync. No cleanup needed.
+              portalOpen = false;
+              break;
+            case BackendKind.ReadyForQuery:
+              this.txStatus = this.reader.bytes[msg.offset] as number;
+              sawReady = true;
+              break;
+            default: {
+              const err = new ProtocolError(
+                `cursor: unexpected message 0x${msg.kind.toString(16).padStart(2, "0")}`,
+              );
+              this.fatal(err);
+              throw err;
+            }
+          }
+        }
+
+        if (pendingError !== null) {
+          throw pendingError;
+        }
+
+        if (batch.length > 0) {
+          // The yield is the suspension point — if the consumer breaks/throws
+          // here, control jumps to the finally block and we run portal cleanup.
+          yield batch;
+        }
+
+        if (completed) {
+          portalOpen = false;
+          break;
+        }
+        if (!suspended) {
+          // Defensive: every Execute(batchSize) reply must end in either
+          // PortalSuspended or CommandComplete (or ErrorResponse). Anything else
+          // means our state machine and the server's are out of sync.
+          const err = new ProtocolError(
+            "cursor: stream ended without PortalSuspended or CommandComplete",
+          );
+          this.fatal(err);
+          throw err;
+        }
+
+        // Request the next batch.
+        this.writer.writeExecute("", batchSize);
+        this.writer.writeSync();
+        await this.flush();
+      }
+
+      this.state = "ready";
+    } finally {
+      // Cleanup runs on normal completion (no-op since portalOpen is false),
+      // on iterator return()/throw() (need to send Close + Sync), and on errors.
+      if (portalOpen) {
+        try {
+          this.writer.writeClose(StatementOrPortal.Portal, "");
+          this.writer.writeSync();
+          await this.flush();
+          // Drain CloseComplete + ReadyForQuery; ignore any leftover acks.
+          while (true) {
+            const msg = await this.awaitMessage();
+            if (msg.kind === BackendKind.ReadyForQuery) {
+              this.txStatus = this.reader.bytes[msg.offset] as number;
+              break;
+            }
+          }
+          this.state = "ready";
+        } catch (err) {
+          // Cleanup itself failed — connection is suspect. Mark it errored so
+          // the pool drops it on next release.
+          this.fatal(
+            err instanceof Error
+              ? new ConnectionError(err.message, { cause: err })
+              : new ConnectionError("cursor cleanup failed"),
+          );
+        }
+      }
+      if (abortHandler !== null && options?.signal !== undefined) {
+        options.signal.removeEventListener("abort", abortHandler);
+      }
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Shared dispatch
+
+  private async runQuery<R>(
+    sql: string,
+    params: ReadonlyArray<unknown>,
+    options: QueryOptions | undefined,
+    encode: () => void,
+  ): Promise<QueryResult<R>> {
+    if (this.state !== "ready") {
+      throw new ConnectionError(`connection not ready (state=${this.state})`);
+    }
+    options?.signal?.throwIfAborted();
+    this.state = "busy";
+
+    // Only sample the clock when somebody's listening — Date.now() is cheap
+    // but not free, and we promise zero hook-related overhead when off.
+    const startMs =
+      this.onQuery !== undefined || this.onError !== undefined ? Date.now() : 0;
+
+    encode();
+
+    let abortHandler: (() => void) | null = null;
+    if (options?.signal !== undefined) {
+      abortHandler = (): void => {
+        // Don't await — the in-flight query will surface 57014 naturally.
+        void this.cancel();
+      };
+      options.signal.addEventListener("abort", abortHandler, { once: true });
+    }
+
+    try {
+      await this.flush();
+      const result = await this.consumeUntilReady<R>();
+      if (this.onQuery !== undefined) {
+        this.onQuery({
+          sql,
+          params,
+          durationMs: Date.now() - startMs,
+          rowCount: result.rowCount,
+          command: result.command,
+          connectionId: this.id,
+        });
+      }
+      return result;
+    } catch (err) {
+      if (this.onError !== undefined) {
+        this.onError({
+          error: err as Error,
+          sql,
+          params,
+          durationMs: Date.now() - startMs,
+          connectionId: this.id,
+        });
+      }
+      throw err;
+    } finally {
+      if (abortHandler !== null && options?.signal !== undefined) {
+        options.signal.removeEventListener("abort", abortHandler);
+      }
+    }
   }
 
   // ────────────────────────────────────────────────────────────────────────
@@ -605,7 +954,9 @@ export class Connection {
       if (msg === null) return;
       // Session-level messages are handled inline; the awaiter never sees them.
       if (msg.kind === BackendKind.NoticeResponse) {
-        // Notices are diagnostic; for now we just drop them. onNotice hook will be added later.
+        if (this.onNotice !== undefined) {
+          this.fireNotice(msg);
+        }
         continue;
       }
       if (msg.kind === BackendKind.ParameterStatus) {
@@ -631,6 +982,41 @@ export class Connection {
       w.resolve(msg);
       return;
     }
+  }
+
+  private fireNotice(msg: BackendMessage): void {
+    let severity = "";
+    let message = "";
+    let code = "";
+    for (const f of readErrorFields(
+      this.reader.bytes,
+      msg.offset,
+      msg.length,
+    )) {
+      switch (f.code) {
+        case FieldCode.SeverityNonLocal:
+          severity = f.value;
+          break;
+        case FieldCode.Severity:
+          if (severity === "") severity = f.value;
+          break;
+        case FieldCode.Message:
+          message = f.value;
+          break;
+        case FieldCode.Code:
+          code = f.value;
+          break;
+        default:
+          break;
+      }
+    }
+    // Hook is checked before this method is called; the bang asserts that.
+    (this.onNotice as OnNotice)({
+      severity,
+      message,
+      code,
+      connectionId: this.id,
+    });
   }
 
   private awaitNegotiationByte(): Promise<number> {
