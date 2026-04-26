@@ -45,8 +45,8 @@ export const timestampCodec: Codec<Date> = {
 export const timestampTzCodec: Codec<Date> = {
   oid: Oid.TimestampTz,
   decode(text) {
-    // 'YYYY-MM-DD HH:MM:SS[.ffffff]±HH[:MM]' parses fine once the space becomes 'T'.
-    return new Date(text.replace(" ", "T"));
+    // Postgres may emit offsets as ±HH; JS Date wants ±HH:MM.
+    return new Date(normalizeTimestampTz(text));
   },
   encode(value) {
     // ISO 8601 with explicit 'Z' offset. Server stores in UTC regardless of input offset.
@@ -63,4 +63,14 @@ function formatIsoNoZone(d: Date): string {
   const s = d.getUTCSeconds().toString().padStart(2, "0");
   const ms = d.getUTCMilliseconds().toString().padStart(3, "0");
   return `${y}-${mo}-${da} ${h}:${mi}:${s}.${ms}`;
+}
+
+function normalizeTimestampTz(text: string): string {
+  return text
+    .replace(" ", "T")
+    .replace(
+      /([+-]\d{2})(\d{2})?$/,
+      (_match, hours: string, minutes: string | undefined) =>
+        `${hours}:${minutes ?? "00"}`,
+    );
 }

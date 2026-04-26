@@ -377,21 +377,26 @@ export class Connection {
     // there's nothing to clean up. After CommandComplete or any ErrorResponse
     // the server has already closed it implicitly — clearing the flag avoids
     // a redundant Close in cleanup.
+    //
+    // Cursor fetches intentionally use Flush between batches, not Sync. Sync
+    // ends the implicit transaction, which closes the portal before the next
+    // Execute can fetch another batch.
+    const portal = `pg_rocket_cursor_${this.id}`;
     let portalOpen = false;
     let rowDescription: FieldDescription[] | null = null;
 
     try {
       this.writer.writeParse("", sql, paramOids);
       this.writer.writeBind({
-        portal: "",
+        portal,
         statement: "",
         paramFormats,
         params: paramBytes,
         resultFormats,
       });
-      this.writer.writeDescribe(StatementOrPortal.Portal, "");
-      this.writer.writeExecute("", batchSize);
-      this.writer.writeSync();
+      this.writer.writeDescribe(StatementOrPortal.Portal, portal);
+      this.writer.writeExecute(portal, batchSize);
+      this.writer.writeFlush();
       await this.flush();
       portalOpen = true;
 
@@ -401,13 +406,15 @@ export class Connection {
         let completed = false;
         let pendingError: PgError | null = null;
 
-        // Drain one round-trip: messages until ReadyForQuery.
-        let sawReady = false;
-        while (!sawReady) {
+        // Drain one fetch response. With Flush, the server stops at either
+        // PortalSuspended, CommandComplete, or ErrorResponse; ReadyForQuery
+        // only arrives after we explicitly send Sync.
+        while (!suspended && !completed && pendingError === null) {
           const msg = await this.awaitMessage();
           switch (msg.kind) {
             case BackendKind.ParseComplete:
             case BackendKind.BindComplete:
+            case BackendKind.CloseComplete:
             case BackendKind.NoData:
             case BackendKind.ParameterDescription:
             case BackendKind.EmptyQueryResponse:
@@ -448,13 +455,9 @@ export class Connection {
                 msg.offset,
                 msg.length,
               );
-              // The server's implicit transaction is now in a failed state;
-              // it auto-closes the portal at the upcoming Sync. No cleanup needed.
+              // The server's implicit transaction is now in a failed state.
+              // Send Sync below to recover to ReadyForQuery before throwing.
               portalOpen = false;
-              break;
-            case BackendKind.ReadyForQuery:
-              this.txStatus = this.reader.bytes[msg.offset] as number;
-              sawReady = true;
               break;
             default: {
               const err = new ProtocolError(
@@ -467,7 +470,13 @@ export class Connection {
         }
 
         if (pendingError !== null) {
+          await this.syncCursorToReady();
           throw pendingError;
+        }
+
+        if (completed) {
+          portalOpen = false;
+          await this.syncCursorToReady();
         }
 
         if (batch.length > 0) {
@@ -477,7 +486,6 @@ export class Connection {
         }
 
         if (completed) {
-          portalOpen = false;
           break;
         }
         if (!suspended) {
@@ -492,18 +500,16 @@ export class Connection {
         }
 
         // Request the next batch.
-        this.writer.writeExecute("", batchSize);
-        this.writer.writeSync();
+        this.writer.writeExecute(portal, batchSize);
+        this.writer.writeFlush();
         await this.flush();
       }
-
-      this.state = "ready";
     } finally {
       // Cleanup runs on normal completion (no-op since portalOpen is false),
       // on iterator return()/throw() (need to send Close + Sync), and on errors.
       if (portalOpen) {
         try {
-          this.writer.writeClose(StatementOrPortal.Portal, "");
+          this.writer.writeClose(StatementOrPortal.Portal, portal);
           this.writer.writeSync();
           await this.flush();
           // Drain CloseComplete + ReadyForQuery; ignore any leftover acks.
@@ -527,6 +533,19 @@ export class Connection {
       }
       if (abortHandler !== null && options?.signal !== undefined) {
         options.signal.removeEventListener("abort", abortHandler);
+      }
+    }
+  }
+
+  private async syncCursorToReady(): Promise<void> {
+    this.writer.writeSync();
+    await this.flush();
+    while (true) {
+      const msg = await this.awaitMessage();
+      if (msg.kind === BackendKind.ReadyForQuery) {
+        this.txStatus = this.reader.bytes[msg.offset] as number;
+        this.state = "ready";
+        return;
       }
     }
   }
