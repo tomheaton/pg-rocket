@@ -10,12 +10,12 @@
     "typecheck": "tsgo --noEmit"
   },
   "dependencies": {
-    "pg": "^8.13.0",
+    "pg": "^8.20.0",
     "pg-rocket": "workspace:*",
-    "postgres": "^3.4.4"
+    "postgres": "^3.4.9"
   },
   "devDependencies": {
-    "@types/pg": "^8.11.0",
+    "@types/pg": "^8.20.0",
     "tsx": "^4.21.0"
   }
 }

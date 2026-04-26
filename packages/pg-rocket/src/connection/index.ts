@@ -4,6 +4,7 @@
 export {
   Connection,
   type ConnectOptions,
+  CopyInController,
   type FieldDescription,
   type OnConnect,
   type PasswordSpec,

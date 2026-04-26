@@ -34,6 +34,21 @@ export interface NoticeEvent {
   readonly connectionId: number;
 }
 
+/**
+ * Asynchronous LISTEN/NOTIFY event. Fires whenever Postgres sends a
+ * `NotificationResponse` to a connection that has executed `LISTEN <channel>`.
+ *
+ * `payload` is whatever string the sender supplied in `NOTIFY` /
+ * `pg_notify(channel, payload)`; empty string if no payload.
+ */
+export interface NotificationEvent {
+  readonly processId: number;
+  readonly channel: string;
+  readonly payload: string;
+  readonly connectionId: number;
+}
+
 export type OnQuery = (event: QueryEvent) => void;
 export type OnError = (event: ErrorEvent) => void;
 export type OnNotice = (event: NoticeEvent) => void;
+export type OnNotification = (event: NotificationEvent) => void;

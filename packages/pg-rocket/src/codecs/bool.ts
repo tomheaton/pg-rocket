@@ -1,5 +1,6 @@
 // Bool codec. Postgres text format uses "t" / "f"; we accept the long forms on
 // decode for tolerance but always emit single-char on encode for terseness.
+// Binary format is a single byte: 0 → false, 1 → true.
 
 import { Oid } from "./oids.js";
 import type { Codec } from "./registry.js";
@@ -13,5 +14,8 @@ export const boolCodec: Codec<boolean> = {
   },
   encode(value) {
     return value ? "t" : "f";
+  },
+  decodeBinary(buf, _view, offset, _length) {
+    return buf[offset] !== 0;
   },
 };

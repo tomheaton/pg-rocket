@@ -5,6 +5,11 @@
 //   timestamp      → 'YYYY-MM-DD HH:MM:SS[.ffffff]'      (no offset; assumed UTC by the codec)
 //   timestamptz    → 'YYYY-MM-DD HH:MM:SS[.ffffff]±HH'   (offset present)
 //
+// Binary formats (per Postgres docs, format_code = 1):
+//   date           → int32: days since 2000-01-01
+//   timestamp      → int64: microseconds since 2000-01-01 00:00:00 (UTC reading)
+//   timestamptz    → int64: microseconds since 2000-01-01 00:00:00 UTC
+//
 // Decoding produces a JS `Date`. Sub-millisecond precision is lost — JS Date is
 // millisecond-resolution. Microsecond-precise consumers can opt into a string
 // codec by overriding the registry entry.
@@ -13,6 +18,12 @@
 
 import { Oid } from "./oids.js";
 import type { Codec } from "./registry.js";
+
+// Postgres counts time from 2000-01-01; JS Date counts from 1970-01-01. The
+// gap is exactly 30 years of UTC milliseconds.
+const PG_EPOCH_MS = Date.UTC(2000, 0, 1);
+const PG_EPOCH_MS_BIGINT = BigInt(PG_EPOCH_MS);
+const MS_PER_DAY = 86_400_000;
 
 export const dateCodec: Codec<Date> = {
   oid: Oid.Date,
@@ -25,6 +36,10 @@ export const dateCodec: Codec<Date> = {
     const m = (value.getUTCMonth() + 1).toString().padStart(2, "0");
     const d = value.getUTCDate().toString().padStart(2, "0");
     return `${y}-${m}-${d}`;
+  },
+  decodeBinary(_buf, view, offset, _length) {
+    const days = view.getInt32(offset, false);
+    return new Date(PG_EPOCH_MS + days * MS_PER_DAY);
   },
 };
 
@@ -40,6 +55,9 @@ export const timestampCodec: Codec<Date> = {
   encode(value) {
     return formatIsoNoZone(value);
   },
+  decodeBinary(_buf, view, offset, _length) {
+    return microsToDate(view.getBigInt64(offset, false));
+  },
 };
 
 export const timestampTzCodec: Codec<Date> = {
@@ -52,7 +70,18 @@ export const timestampTzCodec: Codec<Date> = {
     // ISO 8601 with explicit 'Z' offset. Server stores in UTC regardless of input offset.
     return value.toISOString();
   },
+  decodeBinary(_buf, view, offset, _length) {
+    return microsToDate(view.getBigInt64(offset, false));
+  },
 };
+
+function microsToDate(micros: bigint): Date {
+  // Round half-toward-zero to milliseconds, then add the JS epoch offset.
+  // BigInt division truncates toward zero, which matches the Postgres /
+  // libpq convention of dropping the sub-millisecond fraction.
+  const ms = micros / 1000n + PG_EPOCH_MS_BIGINT;
+  return new Date(Number(ms));
+}
 
 function formatIsoNoZone(d: Date): string {
   const y = d.getUTCFullYear().toString().padStart(4, "0");

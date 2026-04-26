@@ -19,6 +19,7 @@
 // to-right sequence — no renumbering pass needed.
 
 import {
+  ArrayParam,
   Cast,
   Fragment,
   Identifier,
@@ -93,6 +94,13 @@ function emitValue(value: unknown, parts: string[], params: unknown[]): void {
   }
   if (value instanceof ValuesList) {
     emitValuesList(value, parts, params);
+    return;
+  }
+  if (value instanceof ArrayParam) {
+    // One $N whose value is the array — distinguishes "single array parameter"
+    // from "spread positional parameters" at the call site.
+    params.push(value.items);
+    parts.push(`$${params.length}`);
     return;
   }
   // Plain value — becomes a parameter.

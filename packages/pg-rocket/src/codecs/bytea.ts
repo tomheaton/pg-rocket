@@ -24,6 +24,11 @@ export const byteaCodec: Codec<Uint8Array> = {
     }
     return out;
   },
+  decodeBinary(buf, _view, offset, length) {
+    // Slice (not subarray) — the reader buffer is reused on the next message;
+    // we hand the user a buffer they own.
+    return buf.slice(offset, offset + length);
+  },
 };
 
 function decodeHex(text: string): Uint8Array {

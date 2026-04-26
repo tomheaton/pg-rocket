@@ -9,7 +9,7 @@
 // AND immediately schedules execution against the pool. Both share the same
 // Fragment shape and materialise via the same code path.
 
-import { cast, id, join, raw, unsafe, values } from "./helpers.js";
+import { array, cast, id, join, raw, unsafe, values } from "./helpers.js";
 import { Fragment } from "./types.js";
 
 interface SqlTag {
@@ -20,6 +20,7 @@ interface SqlTag {
   readonly cast: typeof cast;
   readonly join: typeof join;
   readonly values: typeof values;
+  readonly array: typeof array;
 }
 
 function sqlImpl(
@@ -36,4 +37,5 @@ export const sql: SqlTag = Object.assign(sqlImpl, {
   cast,
   join,
   values,
+  array,
 });

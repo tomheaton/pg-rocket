@@ -5,11 +5,17 @@
 //   sql.raw(text)             → alias for sql.unsafe, reads better at the call site
 //   sql.cast(value, "jsonb")  → $N::jsonb
 //   sql.join(parts, sep)      → fragments joined with separator (default: " and ")
-//
-// `values` and `array` helpers ship with the bulk-insert / array slice and are
-// not yet implemented.
+//   sql.values(rows, cols?)   → multi-row VALUES expansion for bulk insert
+//   sql.array([...])          → single-array parameter (vs. spread positional)
 
-import { Cast, Fragment, Identifier, Unsafe, ValuesList } from "./types.js";
+import {
+  ArrayParam,
+  Cast,
+  Fragment,
+  Identifier,
+  Unsafe,
+  ValuesList,
+} from "./types.js";
 
 export function id(...parts: string[]): Identifier {
   if (parts.length === 0) {
@@ -79,4 +85,17 @@ export function values(
     throw new TypeError("sql.values: empty column list");
   }
   return new ValuesList(rows, cols);
+}
+
+/**
+ * Tag a JS array as a single Postgres array parameter.
+ *
+ *   sql`select * from u where role = any(${sql.array(["admin", "editor"])})`
+ *
+ * Without this wrapper a JS array would still encode as a single parameter
+ * — the codec layer doesn't spread it — but the *intent* is opaque at the
+ * call site. `sql.array(...)` makes it explicit at review time.
+ */
+export function array(items: readonly unknown[]): ArrayParam {
+  return new ArrayParam(items);
 }

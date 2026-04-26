@@ -72,45 +72,74 @@ export class PgError extends Error {
   }
 }
 
-// SQLSTATE-class subclasses for the codes people actually want to catch.
-// Subclassing is structural here — instanceof checks work; constructor delegation only.
+// SQLSTATE-class hierarchy. Two layers:
+//
+//   IntegrityError, TransactionError, PgSyntaxError, InsufficientResources are
+//   the *class* level — `instanceof IntegrityError` matches any 23xxx, even
+//   ones we don't ship a specific subclass for. Useful when callers want to
+//   catch "anything in the integrity family" without listing every code.
+//
+//   UniqueViolation / ForeignKeyViolation / SerializationFailure / etc. are
+//   the *specific* level — exact SQLSTATE matches.
+//
+// Subclasses delegate to PgError's constructor and only override `name`.
 
-export class UniqueViolation extends PgError {
+export class IntegrityError extends PgError {
+  constructor(fields: PgErrorFields) {
+    super(fields);
+    this.name = "IntegrityError";
+  }
+}
+export class UniqueViolation extends IntegrityError {
   constructor(fields: PgErrorFields) {
     super(fields);
     this.name = "UniqueViolation";
   }
 }
-export class ForeignKeyViolation extends PgError {
+export class ForeignKeyViolation extends IntegrityError {
   constructor(fields: PgErrorFields) {
     super(fields);
     this.name = "ForeignKeyViolation";
   }
 }
-export class NotNullViolation extends PgError {
+export class NotNullViolation extends IntegrityError {
   constructor(fields: PgErrorFields) {
     super(fields);
     this.name = "NotNullViolation";
   }
 }
-export class CheckViolation extends PgError {
+export class CheckViolation extends IntegrityError {
   constructor(fields: PgErrorFields) {
     super(fields);
     this.name = "CheckViolation";
   }
 }
-export class SerializationFailure extends PgError {
+export class ExclusionViolation extends IntegrityError {
+  constructor(fields: PgErrorFields) {
+    super(fields);
+    this.name = "ExclusionViolation";
+  }
+}
+
+export class TransactionError extends PgError {
+  constructor(fields: PgErrorFields) {
+    super(fields);
+    this.name = "TransactionError";
+  }
+}
+export class SerializationFailure extends TransactionError {
   constructor(fields: PgErrorFields) {
     super(fields);
     this.name = "SerializationFailure";
   }
 }
-export class DeadlockDetected extends PgError {
+export class DeadlockDetected extends TransactionError {
   constructor(fields: PgErrorFields) {
     super(fields);
     this.name = "DeadlockDetected";
   }
 }
+
 export class QueryCanceled extends PgError {
   constructor(fields: PgErrorFields) {
     super(fields);
@@ -118,17 +147,80 @@ export class QueryCanceled extends PgError {
   }
 }
 
+export class InsufficientResources extends PgError {
+  constructor(fields: PgErrorFields) {
+    super(fields);
+    this.name = "InsufficientResources";
+  }
+}
+
+export class PgSyntaxError extends PgError {
+  constructor(fields: PgErrorFields) {
+    super(fields);
+    this.name = "PgSyntaxError";
+  }
+}
+export class UndefinedColumn extends PgSyntaxError {
+  constructor(fields: PgErrorFields) {
+    super(fields);
+    this.name = "UndefinedColumn";
+  }
+}
+export class UndefinedTable extends PgSyntaxError {
+  constructor(fields: PgErrorFields) {
+    super(fields);
+    this.name = "UndefinedTable";
+  }
+}
+export class UndefinedFunction extends PgSyntaxError {
+  constructor(fields: PgErrorFields) {
+    super(fields);
+    this.name = "UndefinedFunction";
+  }
+}
+
+// Specific-code map. Looked up first — exact match wins over class fallback.
 const SQLSTATE_SUBCLASS: Readonly<
   Record<string, new (fields: PgErrorFields) => PgError>
 > = {
+  // 23xxx — integrity_constraint_violation
   "23505": UniqueViolation,
   "23503": ForeignKeyViolation,
   "23502": NotNullViolation,
   "23514": CheckViolation,
+  "23P01": ExclusionViolation,
+  // 40xxx — transaction_rollback
   "40001": SerializationFailure,
   "40P01": DeadlockDetected,
+  // 42xxx — syntax_error_or_access_rule_violation
+  "42703": UndefinedColumn,
+  "42P01": UndefinedTable,
+  "42883": UndefinedFunction,
+  // 57014 — query_canceled
   "57014": QueryCanceled,
 };
+
+// SQLSTATE class fallback by 2-character prefix. Used when the specific code
+// isn't in the map above — `23xyz` (any unknown integrity violation) still
+// surfaces as IntegrityError so generic catches work.
+function classForSqlstate(
+  code: string,
+): (new (fields: PgErrorFields) => PgError) | undefined {
+  if (code.length < 2) return undefined;
+  const cls = code.slice(0, 2);
+  switch (cls) {
+    case "23":
+      return IntegrityError;
+    case "40":
+      return TransactionError;
+    case "42":
+      return PgSyntaxError;
+    case "53":
+      return InsufficientResources;
+    default:
+      return undefined;
+  }
+}
 
 // Connection-level errors are a separate hierarchy from server-side PgError so that
 // callers can distinguish "the query failed" from "the connection itself broke".
@@ -151,6 +243,44 @@ export class ProtocolError extends ConnectionError {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
     this.name = "ProtocolError";
+  }
+}
+
+/**
+ * Raised when a `db.with({ timeout })` deadline fires, or any other
+ * client-side timeout (connection acquire, idle handshake) elapses. Lives
+ * under ConnectionError because there's no server-side state involved.
+ */
+export class TimeoutError extends ConnectionError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "TimeoutError";
+  }
+}
+
+// Codec failures are their own root — they're neither server-side errors
+// (the server didn't reject anything) nor connection-level (the transport
+// is fine). They mean "we couldn't translate between Postgres bytes and a
+// JS value", which is independent of both directions of failure.
+
+export class CodecError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "CodecError";
+  }
+}
+
+export class EncodingError extends CodecError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "EncodingError";
+  }
+}
+
+export class DecodingError extends CodecError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "DecodingError";
   }
 }
 
@@ -264,6 +394,9 @@ export function decodeErrorResponse(
     routine,
   };
 
-  const Subclass = SQLSTATE_SUBCLASS[code];
-  return Subclass ? new Subclass(fields) : new PgError(fields);
+  const specific = SQLSTATE_SUBCLASS[code];
+  if (specific !== undefined) return new specific(fields);
+  const cls = classForSqlstate(code);
+  if (cls !== undefined) return new cls(fields);
+  return new PgError(fields);
 }

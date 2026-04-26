@@ -70,3 +70,18 @@ export class ValuesList extends SqlPart {
     super();
   }
 }
+
+/**
+ * Array parameter wrapper. JS arrays would otherwise be ambiguous: are they
+ * one Postgres array parameter, or N positional ones? `sql.array(...)` makes
+ * the intent explicit — it always emits as a single `$N` whose value is the
+ * array, encoded by the codec layer.
+ *
+ *   sql`select * from u where role = any(${sql.array(['admin','editor'])})`
+ *   → select * from u where role = any($1)   params: [['admin','editor']]
+ */
+export class ArrayParam extends SqlPart {
+  constructor(readonly items: readonly unknown[]) {
+    super();
+  }
+}

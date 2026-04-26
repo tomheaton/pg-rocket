@@ -4,10 +4,11 @@
 // a flat-array index rather than a Map. Higher-OID user-registered types fall
 // into a Map fallback. Lookup is `builtins[oid] ?? overflow.get(oid)`.
 //
-// Codecs in this slice operate on text-format wire bytes only — Bind requests
-// all-text results, params are encoded as text. Binary codecs land with the
-// prepared-cache slice (where Describe-statement gives us column OIDs ahead of
-// Bind, so we can request binary per-column).
+// Codecs always supply text-format `decode` / `encode`. They MAY additionally
+// supply `decodeBinary` — when present, the connection layer can request
+// `Format.Binary` for that column at Bind time on prepared-cache hits (where
+// the column OIDs are known up front from a previous run). Param encoding is
+// text-only in v0; binary param encoding is a follow-up slice.
 
 const MAX_BUILTIN_OID = 4096;
 
@@ -17,6 +18,17 @@ export interface Codec<T> {
   decode(text: string): T;
   /** Render a value as Postgres-acceptable text. The server parses it on the other side. */
   encode(value: T): string;
+  /**
+   * Optional fast-path binary decoder. The wire format follows the per-type
+   * conventions Postgres documents for `format_code = 1`; consult `int.ts`,
+   * `float.ts`, etc. for the specific encodings we honour.
+   */
+  decodeBinary?(
+    buf: Uint8Array,
+    view: DataView,
+    offset: number,
+    length: number,
+  ): T;
 }
 
 export class CodecRegistry {

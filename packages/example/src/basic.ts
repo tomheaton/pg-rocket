@@ -59,6 +59,10 @@ async function main(): Promise<void> {
     await queryOpenTodos(db);
     await completeOneTodo(db);
     await readWithCursor(db);
+    await bulkLoadWithCopy(db);
+    await readBackWithCopyOut(db);
+    await exerciseBinaryDecode(db);
+    await exerciseArrays(db);
   } finally {
     await db.close();
   }
@@ -158,6 +162,110 @@ async function readWithCursor(
       console.log(formatTodo(row));
     }
   }
+}
+
+async function exerciseArrays(
+  db: ReturnType<typeof createClient>,
+): Promise<void> {
+  console.log(`array round-trip:`);
+
+  // Param-side: pass a JS int array and let `any($1)` filter the table.
+  const ids = [1, 3];
+  const matched = await db.sql<{ id: number; title: string }>`
+    select id, title from ${TABLE} where id = any(${ids}) order by id
+  `;
+  console.log(
+    `  any($1) with [${ids.join(", ")}] matched ${matched.length} rows:`,
+  );
+  for (const row of matched) console.log(`    #${row.id} ${row.title}`);
+
+  // Result-side: array_agg returns a real Postgres array; the codec parses
+  // the {.,.} text format back to a JS array of numbers.
+  const agg = await db.sqlOne<{ ids: number[]; titles: string[] }>`
+    select array_agg(id order by id) as ids,
+           array_agg(title order by id) as titles
+    from ${TABLE}
+    where title like 'Bulk-loaded%'
+  `;
+  console.log(`  array_agg(id):    [${agg.ids.join(", ")}]`);
+  console.log(
+    `  array_agg(title): [${agg.titles.map((t) => JSON.stringify(t)).join(", ")}]`,
+  );
+}
+
+async function exerciseBinaryDecode(
+  db: ReturnType<typeof createClient>,
+): Promise<void> {
+  // The first call Parses the statement; the second call hits the prepared
+  // cache, which has now learned the column OIDs and switches to per-column
+  // binary result formats. Both calls should produce identical typed values.
+  console.log(`binary-format round-trip:`);
+  const point = async (
+    label: string,
+  ): Promise<{ id: number; priority: number; created_at: Date }> => {
+    const row = await db.sqlOne<TodoRow>`
+      select id, priority, created_at
+      from ${TABLE}
+      where id = ${1}
+    `;
+    console.log(
+      `  ${label}: id=${row.id} priority=${row.priority} created_at=${row.created_at.toISOString()}`,
+    );
+    return row;
+  };
+  const first = await point("text   pass");
+  const second = await point("binary pass");
+  if (
+    first.id !== second.id ||
+    first.priority !== second.priority ||
+    first.created_at.getTime() !== second.created_at.getTime()
+  ) {
+    throw new Error("binary decode disagreed with text decode");
+  }
+  console.log(`  text and binary decode produced identical rows`);
+}
+
+async function bulkLoadWithCopy(
+  db: ReturnType<typeof createClient>,
+): Promise<void> {
+  const writer = await db.copy.in(`${SCHEMA}.todos`, [
+    "title",
+    "priority",
+    "metadata",
+  ]);
+  await writer.write([
+    {
+      title: "Bulk-loaded A",
+      priority: 1,
+      metadata: { source: "copy", estimateMinutes: 3 },
+    },
+    {
+      title: "Bulk-loaded B (with\ttab and \\backslash)",
+      priority: 2,
+      metadata: { source: "copy", estimateMinutes: 4 },
+    },
+    {
+      title: "Bulk-loaded C",
+      priority: 3,
+      metadata: { source: "copy", estimateMinutes: 5 },
+    },
+  ]);
+  const result = await writer.end();
+  console.log(`copied ${result.rowCount} rows via COPY FROM STDIN`);
+}
+
+async function readBackWithCopyOut(
+  db: ReturnType<typeof createClient>,
+): Promise<void> {
+  console.log(`copy-out (text) of bulk-loaded rows:`);
+  const reader = db.copy.out(
+    `select title, priority from ${SCHEMA}.todos where title like 'Bulk-loaded%' order by id`,
+  );
+  for await (const row of reader.text(["title", "priority"])) {
+    console.log(`  ${row.priority}\t${row.title}`);
+  }
+  const { rowCount } = await reader.result();
+  console.log(`copy-out emitted ${rowCount} rows`);
 }
 
 function formatTodo(row: TodoRow): string {

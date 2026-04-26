@@ -12,7 +12,9 @@
 // dispatches. Re-aliasing is fine: `db.with({ timeout: 1000 }).with({ signal })`
 // stacks the inner signal on top of the timeout.
 //
-// Cursor / copy / listen will hang off this object in the next slice.
+// `db.sql` is a tag function with `.values<T>` / `.raw<T>` sub-tags for scalar
+// and tuple result modes; `db.cursor` streams a fragment in batches.
+// COPY and LISTEN/NOTIFY land in upcoming slices.
 //
 // `createClient` accepts either a connection-string `url` or the same fields
 // individually. Either way we end up with the same {@link ConnectOptions} the
@@ -24,7 +26,13 @@ import type {
   QueryOptions,
   Row,
 } from "./connection/index.js";
-import { ConnectionError } from "./errors.js";
+import { CopyApi } from "./copy.js";
+import { ConnectionError, TimeoutError } from "./errors.js";
+import {
+  ListenerManager,
+  type NotificationHandler,
+  type Subscription,
+} from "./listen.js";
 import { Pool, type PoolOptions, parseConnectionString } from "./pool/index.js";
 import { Fragment, materialize } from "./sql/index.js";
 import {
@@ -51,8 +59,12 @@ export interface CreateClientOptions {
   readonly onError?: ConnectOptions["onError"];
   readonly onNotice?: ConnectOptions["onNotice"];
   readonly onConnect?: ConnectOptions["onConnect"];
-  /** Pool sizing + lifecycle. */
-  readonly pool?: { readonly max?: number; readonly idleTimeoutMs?: number };
+  /** Pool sizing + lifecycle, plus per-connection prepared-statement cache size. */
+  readonly pool?: {
+    readonly max?: number;
+    readonly idleTimeoutMs?: number;
+    readonly statementCacheSize?: number;
+  };
 }
 
 /** Layered options applied to every query/transaction dispatched through this Db. */
@@ -63,13 +75,75 @@ export interface DbOptions {
   readonly timeout?: number | undefined;
 }
 
+/**
+ * The `db.sql` surface: a tag function with `.values<T>` and `.raw<T>` result-mode
+ * sub-tags hanging off it.
+ *
+ *   await db.sql<User>`...`             → User[]
+ *   await db.sql.values<number>`...`    → number[]   (single-column queries)
+ *   await db.sql.raw<[string, number]>`...` → [string, number][] (tuples)
+ *
+ * `.values` and `.raw` skip object-construction in favour of scalars / tuples;
+ * pick the one that matches the query shape.
+ */
+export interface SqlMethod {
+  <R extends Row = Row>(
+    strings: TemplateStringsArray,
+    ...values: unknown[]
+  ): Promise<R[]>;
+  values<T = unknown>(
+    strings: TemplateStringsArray,
+    ...values: unknown[]
+  ): Promise<T[]>;
+  raw<T extends readonly unknown[] = unknown[]>(
+    strings: TemplateStringsArray,
+    ...values: unknown[]
+  ): Promise<T[]>;
+}
+
+type RowMode = "object" | "values" | "raw";
+
 export class Db {
+  /**
+   * Tagged-template entry point. Built in the constructor so `.values` /
+   * `.raw` can hang off it; the main tag and the sub-tags share the same
+   * pool-acquire path with different row-shaping.
+   */
+  readonly sql: SqlMethod;
+
+  /**
+   * Bulk-load surface — `db.copy.in(...)` and `db.copy.out(...)`. Each call
+   * acquires a connection from the pool for the lifetime of the writer/reader,
+   * routing the release back through `releaseOrDestroy` so a connection that
+   * errored mid-COPY is dropped rather than poisoning the pool.
+   */
+  readonly copy: CopyApi;
+
+  /** Lazy listener-connection manager, created on first `listen()` call. */
+  private listener: ListenerManager | null = null;
+
   /** @internal — user code goes through `createClient`. */
   constructor(
     protected readonly pool: Pool,
     protected readonly connectOptions: ConnectOptions,
     protected readonly opts: DbOptions = {},
-  ) {}
+  ) {
+    const tag = <R>(
+      strings: TemplateStringsArray,
+      ...values: unknown[]
+    ): Promise<R[]> => this.executeShape<R>("object", strings, values);
+    this.sql = Object.assign(tag, {
+      values: <T>(
+        strings: TemplateStringsArray,
+        ...values: unknown[]
+      ): Promise<T[]> => this.executeShape<T>("values", strings, values),
+      raw: <T extends readonly unknown[]>(
+        strings: TemplateStringsArray,
+        ...values: unknown[]
+      ): Promise<T[]> => this.executeShape<T>("raw", strings, values),
+    }) as SqlMethod;
+    this.copy = new CopyApi(this.pool, (conn) => this.releaseOrDestroy(conn));
+  }
 
   /**
    * Layer extra options on top of this Db. Returns a new `Db`-shaped facade
@@ -85,23 +159,8 @@ export class Db {
   }
 
   /**
-   * Execute a parameterised query against the pool. Acquires a connection,
-   * runs the extended-query path, releases the connection — even on error.
-   */
-  async sql<R extends Row = Row>(
-    strings: TemplateStringsArray,
-    ...values: unknown[]
-  ): Promise<R[]> {
-    const m = materialize(new Fragment(strings, values));
-    return this.runOnConnection(async (conn, queryOpts) => {
-      const result = await conn.extQuery<R>(m.sql, m.params, queryOpts);
-      return result.rows;
-    });
-  }
-
-  /**
-   * One-row variant. Throws if the query returns anything other than exactly
-   * one row — saves the call site from repeated `[0]`-or-throw boilerplate.
+   * One-row variant of `sql`. Throws if the query returns anything other than
+   * exactly one row — saves the call site from repeated `[0]`-or-throw boilerplate.
    */
   async sqlOne<R extends Row = Row>(
     strings: TemplateStringsArray,
@@ -117,19 +176,27 @@ export class Db {
   /**
    * Stream a query in batches. Holds a connection from the pool for the
    * lifetime of the iterator; releases it when the iterator completes or is
-   * abandoned (`break`, `throw`, `return()` — `for await` handles all three).
+   * abandoned (`break`, `throw`, `return()`, `await using` — all four work).
    *
    *   for await (const batch of db.cursor<Row>(sql`select * from t`, 1000)) {
    *     for (const row of batch) process(row);
+   *   }
+   *
+   *   for await (const row of db.cursor<Row>(sql`...`, 1000).rows()) {
+   *     // per-row, batches flattened
    *   }
    *
    * Layered options (`db.with({ signal, timeout })`) apply: aborting the signal
    * cancels the in-flight Execute via the side-channel CancelRequest, after
    * which the iterator throws.
    */
-  async *cursor<R extends Row = Row>(
+  cursor<R extends Row = Row>(fragment: Fragment, batchSize = 100): Cursor<R> {
+    return new Cursor<R>(this.cursorBatches<R>(fragment, batchSize));
+  }
+
+  private async *cursorBatches<R>(
     fragment: Fragment,
-    batchSize = 100,
+    batchSize: number,
   ): AsyncGenerator<R[], void, undefined> {
     const m = materialize(fragment);
     const { queryOpts, cleanup } = this.buildPerCallOptions();
@@ -163,8 +230,44 @@ export class Db {
     return runInTransaction(this.pool, fn, options);
   }
 
-  /** Drain and close the pool. Idempotent. */
+  /**
+   * Subscribe to a Postgres LISTEN channel. Lazy-creates a dedicated listener
+   * connection on first call (separate from the query pool — pool connections
+   * don't park waiting for notifications). Multiple `listen()` calls share the
+   * same listener connection regardless of channel.
+   *
+   *   const sub = await db.listen("user_events", (payload, channel) => {
+   *     console.log("event:", payload, "on", channel);
+   *   });
+   *   // ...later
+   *   await sub.unlisten();
+   */
+  async listen(
+    channel: string,
+    handler: NotificationHandler,
+  ): Promise<Subscription> {
+    if (this.listener === null) {
+      this.listener = new ListenerManager(this.connectOptions);
+    }
+    return this.listener.subscribe(channel, handler);
+  }
+
+  /**
+   * Send a NOTIFY. `select pg_notify($1, $2)` under the hood — uses the regular
+   * pool, no special connection handling. The `payload` defaults to empty
+   * string; Postgres caps it at ~8000 bytes.
+   */
+  async notify(channel: string, payload = ""): Promise<void> {
+    await this._unsafeExtQuery("select pg_notify($1, $2)", [channel, payload]);
+  }
+
+  /** Drain and close the pool, plus tear down the listener connection if any. Idempotent. */
   async close(): Promise<void> {
+    if (this.listener !== null) {
+      const listener = this.listener;
+      this.listener = null;
+      await listener.close();
+    }
     await this.pool.close();
   }
 
@@ -190,6 +293,29 @@ export class Db {
 
   // ────────────────────────────────────────────────────────────────────────
   // internals
+
+  /**
+   * Run the materialised fragment through a connection, then shape the rows
+   * for the requested mode:
+   *
+   *   "object" → Record<string, unknown>     (the default sql tag)
+   *   "values" → first column of each row    (sql.values<T>)
+   *   "raw"    → array of column values      (sql.raw<T>)
+   *
+   * Shaping is post-processing on row objects today; pushing the mode into
+   * the connection-layer decoder is a v0.1 perf optimisation.
+   */
+  private async executeShape<R>(
+    mode: RowMode,
+    strings: TemplateStringsArray,
+    values: readonly unknown[],
+  ): Promise<R[]> {
+    const m = materialize(new Fragment(strings, values));
+    return this.runOnConnection(async (conn, queryOpts) => {
+      const result = await conn.extQuery<Row>(m.sql, m.params, queryOpts);
+      return shapeRows(result.rows, mode) as R[];
+    });
+  }
 
   /**
    * Acquire a connection, build per-call QueryOptions (signal + timeout
@@ -248,7 +374,7 @@ export class Db {
       if (timeoutMs !== undefined) {
         timer = setTimeout(() => {
           ctrl.abort(
-            new Error(`pg-rocket: query exceeded timeout of ${timeoutMs}ms`),
+            new TimeoutError(`query exceeded timeout of ${timeoutMs}ms`),
           );
         }, timeoutMs);
       }
@@ -293,6 +419,62 @@ export function createClient(options: CreateClientOptions): Db {
   return new Db(pool, connect);
 }
 
+/**
+ * Wrapper around a streaming cursor's batch generator. Iterating the Cursor
+ * directly yields batches; `cursor.rows()` flattens to per-row iteration.
+ *
+ * Both share the same underlying generator, so `break` / `throw` / `return()` /
+ * `await using` on either iteration form propagates cleanup (Close + Sync) to
+ * the connection layer and releases the connection to the pool.
+ */
+export class Cursor<R> implements AsyncIterable<R[]>, AsyncDisposable {
+  /** @internal — built by `Db.cursor`. */
+  constructor(private readonly batches: AsyncGenerator<R[], void, undefined>) {}
+
+  [Symbol.asyncIterator](): AsyncIterator<R[], void, undefined> {
+    return this.batches;
+  }
+
+  /** Per-row iteration; flattens batches. */
+  async *rows(): AsyncGenerator<R, void, undefined> {
+    for await (const batch of this.batches) {
+      for (let i = 0; i < batch.length; i++) {
+        yield batch[i] as R;
+      }
+    }
+  }
+
+  /** Explicit close — same effect as iterating to completion or breaking out. */
+  async close(): Promise<void> {
+    await this.batches.return();
+  }
+
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.batches.return();
+  }
+}
+
+function shapeRows(rows: readonly Row[], mode: RowMode): unknown[] {
+  if (mode === "object") return rows as unknown[];
+  if (mode === "values") {
+    const out = new Array<unknown>(rows.length);
+    for (let i = 0; i < rows.length; i++) {
+      // First column only. Values() insertion order matches the column order
+      // produced by the row decoder, which matches RowDescription order.
+      const row = rows[i] as Row;
+      const keys = Object.keys(row);
+      out[i] = keys.length > 0 ? row[keys[0] as string] : undefined;
+    }
+    return out;
+  }
+  // "raw" — tuple of column values per row.
+  const out = new Array<unknown[]>(rows.length);
+  for (let i = 0; i < rows.length; i++) {
+    out[i] = Object.values(rows[i] as Row);
+  }
+  return out;
+}
+
 function resolveConnectOptions(options: CreateClientOptions): ConnectOptions {
   // URL parsing is the cheap path: parse once, then layer inline overrides on top.
   const fromUrl =
@@ -332,6 +514,9 @@ function resolveConnectOptions(options: CreateClientOptions): ConnectOptions {
     ...(options.onNotice !== undefined ? { onNotice: options.onNotice } : {}),
     ...(options.onConnect !== undefined
       ? { onConnect: options.onConnect }
+      : {}),
+    ...(options.pool?.statementCacheSize !== undefined
+      ? { preparedCacheSize: options.pool.statementCacheSize }
       : {}),
   };
   return connect;
