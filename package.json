@@ -1,7 +1,7 @@
 {
   "name": "pg-rocket",
   "version": "0.0.0",
-  "description": "PG Rocket",
+  "description": "A fast, lightweight PostgreSQL client for Node.",
   "scripts": {
     "lint": "biome check",
     "lint:ci": "biome ci",
