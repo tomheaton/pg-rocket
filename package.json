@@ -3,6 +3,12 @@
   "version": "0.0.0",
   "description": "A fast, lightweight PostgreSQL client for Node.",
   "scripts": {
+    "bench": "pnpm --filter @pg-rocket/bench bench",
+    "bench:seed": "pnpm --filter @pg-rocket/bench seed",
+    "db:down": "docker compose -f packages/test-utils/docker-compose.yaml down",
+    "db:logs": "docker compose -f packages/test-utils/docker-compose.yaml logs -f",
+    "db:reset": "docker compose -f packages/test-utils/docker-compose.yaml down -v && docker compose -f packages/test-utils/docker-compose.yaml up -d --wait",
+    "db:up": "docker compose -f packages/test-utils/docker-compose.yaml up -d --wait",
     "lint": "biome check",
     "lint:ci": "biome ci",
     "lint:fix": "biome check --fix"

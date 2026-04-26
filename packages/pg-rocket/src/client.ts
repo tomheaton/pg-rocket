@@ -173,6 +173,21 @@ export class Db {
     return this.connectOptions;
   }
 
+  /**
+   * @internal — escape hatch for benchmarks. Bypasses the `sql` tag so callers
+   * can supply raw SQL + parameters they've already produced (e.g. via fixture
+   * data). Application code should use the tag instead.
+   */
+  async _unsafeExtQuery<R extends Row = Row>(
+    sql: string,
+    params: readonly unknown[] = [],
+  ): Promise<R[]> {
+    return this.runOnConnection(async (conn, queryOpts) => {
+      const result = await conn.extQuery<R>(sql, params, queryOpts);
+      return result.rows;
+    });
+  }
+
   // ────────────────────────────────────────────────────────────────────────
   // internals
 

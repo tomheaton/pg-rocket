@@ -203,13 +203,13 @@ pg-rocket/
 │   │   ├── results/                # JSON, committed for tracking
 │   │   └── package.json
 │   └── test-utils/
-│       └── docker-compose.yml      # pg14, pg15, pg16, pg17
+│       └── docker-compose.yaml      # pg14, pg15, pg16, pg17
 ├── docs/
 │   └── design/
 │       └── 0000-overview.md        # this doc
 ├── .github/workflows/
-│   ├── test.yml
-│   └── bench.yml
+│   ├── test.yaml
+│   └── bench.yaml
 ├── pnpm-workspace.yaml
 ├── tsconfig.base.json
 ├── biome.json

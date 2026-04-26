@@ -5,8 +5,8 @@
   "description": "pg-rocket vs pg vs postgres.js head-to-head benchmarks (local-only).",
   "type": "module",
   "scripts": {
-    "seed": "node --experimental-strip-types src/seed.ts",
-    "bench": "node --experimental-strip-types src/run.ts",
+    "bench": "tsx src/run.ts",
+    "seed": "tsx src/seed.ts",
     "typecheck": "tsgo --noEmit"
   },
   "dependencies": {
@@ -15,6 +15,7 @@
     "postgres": "^3.4.4"
   },
   "devDependencies": {
-    "@types/pg": "^8.11.0"
+    "@types/pg": "^8.11.0",
+    "tsx": "^4.21.0"
   }
 }
