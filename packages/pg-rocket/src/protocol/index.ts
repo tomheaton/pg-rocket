@@ -3,6 +3,13 @@
 export { md5PasswordToken } from "./auth/md5.js";
 export * as scram from "./auth/scram.js";
 export { base64Decode, base64Encode } from "./base64.js";
+export {
+  type CStringResult,
+  parseCommandTag,
+  readCString,
+  readErrorFields,
+  readUtf8,
+} from "./body.js";
 export type { CryptoProvider } from "./crypto.js";
 export {
   AuthRequest,

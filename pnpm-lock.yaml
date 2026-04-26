@@ -11,9 +11,18 @@ importers:
       '@biomejs/biome':
         specifier: ^2.4.13
         version: 2.4.13
+      '@types/node':
+        specifier: ^25.6.0
+        version: 25.6.0
       '@typescript/native-preview':
         specifier: 7.0.0-dev.20260421.2
         version: 7.0.0-dev.20260421.2
+
+  packages/pg-rocket:
+    devDependencies:
+      '@types/node':
+        specifier: ^25.6.0
+        version: 25.6.0
 
 packages:
 
@@ -74,6 +83,9 @@ packages:
     cpu: [x64]
     os: [win32]
 
+  '@types/node@25.6.0':
+    resolution: {integrity: sha512-+qIYRKdNYJwY3vRCZMdJbPLJAtGjQBudzZzdzwQYkEPQd+PJGixUL5QfvCLDaULoLv+RhT3LDkwEfKaAkgSmNQ==}
+
   '@typescript/native-preview-darwin-arm64@7.0.0-dev.20260421.2':
     resolution: {integrity: sha512-fHv1r3ZmVo6zxuAIFmuX3w9QxbcauoG0SsWhmDwm6VmRubLlOJIcmTtlmV3JAb9oOnq8LuzZljzT7Q39fSMQDw==}
     cpu: [arm64]
@@ -113,6 +125,9 @@ packages:
     resolution: {integrity: sha512-CmajHI25HpVWE9R1XFoxr+cphJPxoYD3eFioQtAvXYkMFKnLdICMS9pXre9Pybizb75ejRxjKD5/CVG055rEIg==}
     hasBin: true
 
+  undici-types@7.19.2:
+    resolution: {integrity: sha512-qYVnV5OEm2AW8cJMCpdV20CDyaN3g0AjDlOGf1OW4iaDEx8MwdtChUp4zu4H0VP3nDRF/8RKWH+IPp9uW0YGZg==}
+
 snapshots:
 
   '@biomejs/biome@2.4.13':
@@ -150,6 +165,10 @@ snapshots:
   '@biomejs/cli-win32-x64@2.4.13':
     optional: true
 
+  '@types/node@25.6.0':
+    dependencies:
+      undici-types: 7.19.2
+
   '@typescript/native-preview-darwin-arm64@7.0.0-dev.20260421.2':
     optional: true
 
@@ -180,3 +199,5 @@ snapshots:
       '@typescript/native-preview-linux-x64': 7.0.0-dev.20260421.2
       '@typescript/native-preview-win32-arm64': 7.0.0-dev.20260421.2
       '@typescript/native-preview-win32-x64': 7.0.0-dev.20260421.2
+
+  undici-types@7.19.2: {}
